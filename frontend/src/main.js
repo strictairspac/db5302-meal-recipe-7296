@@ -5,8 +5,8 @@ import {topic} from './constants/project.js';
 import {loginPage} from './pages/login.js';
 import {casesPage} from './pages/cases.js';
 import {bindEditor, editorPage} from './pages/editor.js';
-import {runsPage} from './pages/runs.js';
 import {bindEvidence, evidencePage} from './pages/evidence.js';
+import {bindRuns, runsPage} from './pages/runs.js';
 import {go, route} from './router/hash.js';
 import {submit} from './hooks/submit.js';
 import {esc} from './utils/dom.js';
@@ -56,6 +56,7 @@ async function refresh() {
   if (page==='evidence') bindEvidence(api, refresh, fail);
   if (page==='runs') {
     document.getElementById('refresh').addEventListener('click', refresh);
+    bindRuns(api, refresh, fail);
     if (state.runs.some(row=>['queued','running'].includes(row.status))) timer=setTimeout(refresh,1000);
   }
 }

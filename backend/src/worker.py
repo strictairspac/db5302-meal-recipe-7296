@@ -1,18 +1,35 @@
 import logging
 from pathlib import Path
 from threading import Event, Thread
-from time import sleep
+from time import monotonic, sleep
 
 from src.config.settings import ARTIFACTS, cache, engine
 from src.services.domain import solve
-from src.services.workflow import claim, finish
+from src.services.expansion import ExpansionInterrupted
+from src.services.workflow import claim, finish, heartbeat, interrup
 
 HEARTBEAT = Path(ARTIFACTS) / 'worker-heartbeat'
+LEASE_REFRESH = 30
 
 
-def heartbeat(stop):
+def heartbeat_file(stop):
     while not stop.is_set():
         HEARTBEAT.touch()
+        stop.wait(2)
+
+
+def lease(stop, run_id, token, lost):
+    """Refresh the run lease so another worker does not reclaim live work."""
+    next_refresh = 0
+    while not stop.is_set():
+        if monotonic() >= next_refresh:
+            try:
+                if not heartbeat(run_id, token):
+                    lost.set()
+                    return
+            except Exception:
+                logging.exception('Lease refresh failed for run %s', run_id)
+            next_refresh = monotonic() + LEASE_REFRESH
         stop.wait(2)
 
 
@@ -27,19 +44,26 @@ def work():
                 continue
             run_id, token, payload = job
             stop = Event()
-            thread = Thread(target=heartbeat, args=(stop,), daemon=True)
-            thread.start()
+            lost = Event()
+            threads = [Thread(target=heartbeat_file, args=(stop,), daemon=True),
+                       Thread(target=lease, args=(stop, run_id, token, lost), daemon=True)]
+            for thread in threads:
+                thread.start()
             try:
-                result = solve(payload, engine)
+                result = solve(payload, engine, run_id=run_id,
+                               should_stop=lambda: not lost.is_set() and not stop.is_set())
                 finish(run_id, token, result=result)
+            except ExpansionInterrupted:
+                interrup(run_id, token)
             except (ValueError, KeyError, TypeError) as exc:
                 finish(run_id, token, error=str(exc)[:500])
             except Exception:
-                logging.exception('Domain run failed: %s', run_id)
-                finish(run_id, token, error='后台执行失败，请检查输入或查看 worker 日志。')
+                logging.exception('Domain run interrupted: %s', run_id)
+                interrup(run_id, token)
             finally:
                 stop.set()
-                thread.join()
+                for thread in threads:
+                    thread.join()
         except Exception:
             logging.exception('Worker loop failure')
             sleep(2)

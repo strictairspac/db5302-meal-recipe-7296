@@ -1,15 +1,13 @@
 """Expand menu recipes and produce a purchase proposal with path evidence."""
 
-import json
 import re
 from collections import Counter
 from decimal import Decimal, InvalidOperation, localcontext
 
-from .recipe_sql import EXPAND_RECIPES
+from .expansion import expand
 
 
 MAX_DEPTH = 8
-MAX_WALK_ROWS = 20_000
 INPUT_STEP = Decimal("0.001")
 CODE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 
@@ -200,7 +198,7 @@ def validate(payload):
 
 
 def _quantity(number):
-    fixed = format(number, "f")
+    fixed = format(Decimal(str(number)), "f")
     return fixed.rstrip("0").rstrip(".") if "." in fixed else fixed
 
 
@@ -226,24 +224,17 @@ def _purchase_row(node, row):
     }
 
 
-def solve(payload, engine):
+def solve(payload, engine, *, run_id=None, should_stop=None):
     batch, menu, nodes, edges, recipe_count = _prepare(payload)
-    with engine.begin() as conn:
-        rows = conn.execute(EXPAND_RECIPES, {
-            "menu": json.dumps(menu),
-            "edges": json.dumps(edges),
-            "recipe_count": recipe_count,
-            "max_depth": MAX_DEPTH,
-            "row_limit": MAX_WALK_ROWS + 1,
-        }).mappings().all()
-
-    budget = next(row for row in rows if row["kind"] == "budget")
-    if budget["path_count"] > MAX_WALK_ROWS:
-        raise ValueError(f"配方展开超过 {MAX_WALK_ROWS} 条记录，无法核准采购量。请检查配方并缩小核算批次。")
+    terminals = expand(menu, edges, recipe_count, engine, max_depth=MAX_DEPTH,
+                       run_id=run_id, should_stop=should_stop)
+    # Match the one-shot recursive query's output order regardless of how the
+    # expansion was split into segments.
+    terminals.sort(key=lambda row: (row["kind"], row["line_id"], row["node_id"], row["path_ids"]))
 
     by_id = {node["id"]: node for node in nodes.values()}
     ratios = {(edge["parent_id"], edge["child_id"]): edge["ratio"] for edge in edges}
-    blocked = Counter(row["line_id"] for row in rows if row["kind"] in ISSUES)
+    blocked = Counter(row["line_id"] for row in terminals if row["kind"] in ISSUES)
     menu_rows = [
         {
             "菜单行": item["line"], "菜品": _label(by_id[item["recipe_id"]]),
@@ -253,33 +244,45 @@ def solve(payload, engine):
         for line_id, item in enumerate(menu, start=1)
     ]
     purchase, evidence, issues = [], [], []
-    for row in rows:
-        kind = row["kind"]
-        if kind == "budget":
-            continue
-        node = by_id[row["node_id"]]
-        if kind == "total":
-            purchase.append(_purchase_row(node, row))
-            continue
-        path_ids = [int(value) for value in row["path_ids"].split(",")]
-        path = [_label(by_id[node_id]) for node_id in path_ids]
-        item = menu[row["line_id"] - 1]
-        if kind == "material":
-            factors = [str(item["servings"])]
-            factors.extend(ratios[edge] for edge in zip(path_ids, path_ids[1:]))
-            evidence.append({
-                "菜单行": item["line"], "原料编号": node["code"], "单位": node["unit"],
-                "配方路径": " → ".join(path), "路径算式": " × ".join(factors),
-                "路径用量": _quantity(row["quantity"]),
-                "采购口径": "冻结，未计入" if row["line_id"] in blocked else "已计入",
-            })
-        else:
-            issue, action = ISSUES[kind]
-            issues.append({
-                "菜单行": item["line"], "异常": issue, "配方路径": " → ".join(path),
-                "闭环": " → ".join(path[path_ids.index(path_ids[-1]):]) if kind == "cycle" else "",
-                "处理动作": action,
-            })
+    totals = {}
+    with localcontext() as context:
+        # Keep sums exact for any number of accumulated paths.
+        context.prec = 60
+        for row in terminals:
+            kind = row["kind"]
+            node = by_id[row["node_id"]]
+            path_ids = [int(value) for value in row["path_ids"].split(",")]
+            path = [_label(by_id[node_id]) for node_id in path_ids]
+            item = menu[row["line_id"] - 1]
+            if kind == "material":
+                factors = [str(item["servings"])]
+                factors.extend(ratios[edge] for edge in zip(path_ids, path_ids[1:]))
+                evidence.append({
+                    "菜单行": item["line"], "原料编号": node["code"], "单位": node["unit"],
+                    "配方路径": " → ".join(path), "路径算式": " × ".join(factors),
+                    "路径用量": _quantity(row["quantity"]),
+                    "采购口径": "冻结，未计入" if row["line_id"] in blocked else "已计入",
+                })
+                if row["line_id"] in blocked:
+                    continue
+                total = totals.setdefault(node["id"], {"quantity": Decimal(0), "path_count": 0, "lines": set()})
+                total["quantity"] += Decimal(row["quantity"])
+                total["path_count"] += 1
+                total["lines"].add(row["line_id"])
+            else:
+                issue, action = ISSUES[kind]
+                issues.append({
+                    "菜单行": item["line"], "异常": issue, "配方路径": " → ".join(path),
+                    "闭环": " → ".join(path[path_ids.index(path_ids[-1]):]) if kind == "cycle" else "",
+                    "处理动作": action,
+                })
+
+    for node_id, total in totals.items():
+        purchase.append(_purchase_row(by_id[node_id], {
+            "quantity": total["quantity"],
+            "menu_count": len(total["lines"]),
+            "path_count": total["path_count"],
+        }))
 
     purchase.sort(key=lambda item: item["原料编号"])
     approved = len(menu) - len(blocked)

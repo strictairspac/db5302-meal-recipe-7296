@@ -49,6 +49,11 @@ def start_run(case_id: int, actor=Depends(operator)):
     return workflow.enqueue(case_id, actor)
 
 
+@router.post('/runs/{run_id}/retry', status_code=202)
+def retry_run(run_id: int, actor=Depends(operator)):
+    return workflow.retry(run_id, actor)
+
+
 @router.get('/evidence')
 def list_evidence(_=Depends(current_user)):
     return workflow.recent(evidence)

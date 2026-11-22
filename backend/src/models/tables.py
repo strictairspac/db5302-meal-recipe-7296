@@ -1,5 +1,5 @@
 from sqlalchemy import (JSON, Column, ForeignKey, Integer, MetaData, String,
-                        Table, Text)
+                        Table, Text, UniqueConstraint)
 
 schema = MetaData()
 users = Table('accounts', schema,
@@ -24,6 +24,10 @@ runs = Table('business_runs', schema,
     Column('finished_at', String(32)),
     Column('created_at', String(32), nullable=False),
     Column('error', Text))
+run_leases = Table('run_leases', schema,
+    Column('run_id', ForeignKey('business_runs.id'), primary_key=True),
+    Column('token', String(36), nullable=False),
+    Column('heartbeat_at', String(32), nullable=False))
 evidence = Table('business_evidence', schema,
     Column('id', Integer, primary_key=True),
     Column('run_id', ForeignKey('business_runs.id'), nullable=False, unique=True),
@@ -38,3 +42,12 @@ audit = Table('audit_events', schema,
     Column('action', String(32), nullable=False),
     Column('reference', String(50), nullable=False),
     Column('created_at', String(32), nullable=False))
+expansion_segments = Table('recipe_expansion_segments', schema,
+    Column('id', Integer, primary_key=True),
+    Column('run_id', ForeignKey('business_runs.id'), nullable=False, index=True),
+    Column('seq', Integer, nullable=False),
+    Column('batch_digest', String(64), nullable=False),
+    Column('row_count', Integer, nullable=False),
+    Column('rows', JSON, nullable=False),
+    Column('created_at', String(32), nullable=False),
+    UniqueConstraint('run_id', 'seq', name='uq_expansion_run_seq'))
